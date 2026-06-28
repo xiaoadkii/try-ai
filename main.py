@@ -20,7 +20,7 @@ import os
 import json
 import uuid
 import asyncio
-from typing import Dict, List
+from typing import Dict, List, Tuple, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +30,13 @@ from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
+# pgvector 驱动 — 仅在 RAG 端点被调用时才需要
+try:
+    import psycopg
+    HAS_PGVECTOR = True
+except ImportError:
+    HAS_PGVECTOR = False
+
 # ---------------------------------------------------------------------------
 # 2) 加载配置
 # ---------------------------------------------------------------------------
@@ -38,6 +45,10 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME = os.getenv("FLASH_NAME", "gpt-4o-mini")
+
+# pgvector / RAG 配置
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("环境变量 OPENAI_API_KEY 未设置，请在 .env 中配置")
@@ -176,6 +187,188 @@ TOOLS = [
 TOOL_DISPATCH: Dict[str, callable] = {
     "get_user_fitness_stats": get_user_fitness_stats,
 }
+
+
+# ============================================================================
+# ★ RAG 向量检索层 — pgvector 对接
+# ============================================================================
+# 从 rag_pipeline.py 的核心逻辑提取，封装为可复用的函数。
+# 生产环境建议：
+#   - pgvector 连接用 psycopg_pool.AsyncConnectionPool（连接池）
+#   - Embedding 调用用 asyncio.Semaphore 限流（API 有 RPM 上限）
+#   - 检索结果用 lru_cache 缓存（高频问题避免重复查向量库）
+
+def _check_pgvector():
+    """确保 pgvector 驱动已安装"""
+    if not HAS_PGVECTOR:
+        raise HTTPException(
+            status_code=500,
+            detail="pgvector 驱动未安装，请执行: uv pip install psycopg[binary]"
+        )
+    if not DATABASE_URL:
+        raise HTTPException(
+            status_code=500,
+            detail="环境变量 DATABASE_URL 未设置，请在 .env 中配置 pgvector 连接"
+        )
+
+
+def _get_pg_connection():
+    """
+    获取 pgvector 同步连接（每次请求新建，用完关闭）。
+
+    ★ 对照 Java：
+       这里相当于 HikariCP 的 dataSource.getConnection()。
+       但 Python 没有内置连接池（psycopg3 的连接池在 psycopg_pool 扩展包中），
+       生产环境应改用 psycopg_pool.AsyncConnectionPool 避免频繁建连/断连开销。
+    """
+    _check_pgvector()
+    return psycopg.connect(DATABASE_URL)
+
+
+async def rag_retrieve(
+    query: str,
+    top_k: int = 2,
+) -> Tuple[List[List[float]], List[dict]]:
+    """
+    RAG 检索核心 — 用户问题 → Embedding → pgvector 余弦相似度 TOP-K。
+
+    ★ async 的原因：
+       1) client.embeddings.create() 是异步的（网络 I/O）
+       2) pgvector 查询目前用同步 psycopg，包在 asyncio.to_thread() 里，
+          不阻塞事件循环。真正的异步方案用 psycopg.AsyncConnection。
+
+    返回:
+        (query_vector, rows)
+        rows 每条: {"id": int, "content": str, "metadata": dict, "similarity": float}
+
+    ★ 对照 Java（Spring WebFlux）：
+       这里相当于：
+         Mono<float[]> embedMono = webClient.post(embedApi, query).bodyToMono(float[].class);
+         Mono<List<DocChunk>> dbMono = r2dbcClient.sql("SELECT ... <=> ...").fetch().all();
+         return embedMono.flatMap(vec -> dbMono);
+       但 Python 的 await 写起来更像同步代码，没有 Mono/flatMap 的嵌套地狱。
+    """
+    # Step 1: 问题 → 向量（异步，网络 I/O）
+    embed_response = await client.embeddings.create(
+        model=EMBEDDING_MODEL,
+        input=query,
+    )
+    query_vector: List[float] = embed_response.data[0].embedding
+
+    # Step 2: pgvector 余弦相似度检索（同步 DB 查询，扔进线程池避免阻塞事件循环）
+    #    <=> = 余弦距离算子，值越小越相似
+    #    1 - distance = 相似度分数（1.0 = 完全相同，0.0 = 完全无关）
+    def _db_search():
+        conn = _get_pg_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        id,
+                        content,
+                        metadata,
+                        1 - (embedding <=> %s::vector) AS similarity
+                    FROM fitness_knowledge
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    (query_vector, query_vector, top_k),
+                )
+                rows = cur.fetchall()
+            return rows
+        finally:
+            conn.close()
+
+    rows = await asyncio.to_thread(_db_search)
+
+    # 组装结果
+    results = [
+        {
+            "id": row[0],
+            "content": row[1],
+            "metadata": row[2] if isinstance(row[2], dict) else {},
+            "similarity": round(float(row[3]), 4),
+        }
+        for row in rows
+    ]
+    return query_vector, results
+
+
+def build_rag_messages(
+    user_prompt: str,
+    retrieved_chunks: List[dict],
+    history: List[dict],
+) -> List[dict]:
+    """
+    ★ 核心拼装：将检索到的参考资料作为 system 指令注入 messages。
+
+    策略：在 system prompt 最前端插入参考资料上下文，强制大模型"看着小抄回答"。
+
+    生成的 messages 结构：
+        [
+            {role: "system", content: "严格基于以下参考资料回答..."},
+            {role: "system", content: "<原始 system prompt>"},   ← 如果有
+            ...历史消息...,
+            {role: "user", content: "<用户当前问题>"},
+        ]
+
+    ★ 为什么用 system 角色而不是 user？
+       system 的优先级最高，大模型会把 system 内容当"铁律"执行。
+       如果放在 user 消息里，大模型可能选择性忽略。
+
+    ★ 对照 Java（Prompt 模板引擎）：
+       Spring AI 里用 StringTemplate 或 Mustache 做类似的事：
+         String prompt = templateEngine.render("rag-prompt.txt", Map.of(
+             "context", joinChunks(chunks),
+             "query", userPrompt
+         ));
+       但手写 f-string 更直观，适合小规模模板。
+    """
+    if not retrieved_chunks:
+        # 无检索结果 → 正常对话，不做 RAG 增强
+        return history + [{"role": "user", "content": user_prompt}]
+
+    # 拼接参考资料
+    context_parts = []
+    for i, chunk in enumerate(retrieved_chunks, 1):
+        sim = chunk["similarity"]
+        content = chunk["content"].strip()
+        context_parts.append(f"[参考资料 {i}]（相似度: {sim:.2%}）\n{content}")
+
+    context_block = "\n\n---\n\n".join(context_parts)
+
+    # 构建 RAG system 指令
+    rag_system_prompt = (
+        "你是一个严格基于参考资料的 AI 助手。请遵守以下铁律：\n"
+        "1. 优先使用下方【参考资料】中的信息回答用户问题。\n"
+        "2. 如果参考资料中明确包含了答案，请直接引用并注明来源（如「根据参考资料1」）。\n"
+        "3. 如果参考资料未提及用户所问的内容，请明确回答："
+        "'抱歉，当前知识库中未找到相关信息，我无法编造答案。'\n"
+        "4. 严禁在参考资料之外自行编造事实、数据或建议。\n\n"
+        f"【参考资料】\n{context_block}\n\n"
+        f"【用户问题】{user_prompt}"
+    )
+
+    # 组装 messages：RAG system 指令放在最前面
+    messages = [{"role": "system", "content": rag_system_prompt}]
+
+    # 如果历史中有原始 system prompt，追加到后面（次优先级）
+    for msg in history:
+        if msg.get("role") == "system":
+            messages.append(msg)
+            break  # 只保留第一个原始 system prompt
+
+    # 追加历史（跳过 system，已处理）
+    for msg in history:
+        if msg.get("role") != "system":
+            messages.append(msg)
+
+    # 追加当前用户消息
+    messages.append({"role": "user", "content": user_prompt})
+
+    return messages
+
 
 # ============================================================================
 # ★ 内存多轮对话历史存储（纯 dict，无任何框架依赖）
@@ -782,8 +975,175 @@ async def chat_function_calling(req: StreamChatRequest):
         )
 
 
+# ============================================================================
+# ★ 8) POST /v1/chat/rag — RAG 增强流式对话（向量检索 + 大模型生成）
+# ============================================================================
+# 完整 RAG 闭环：用户问题 → Embedding → pgvector 检索 → Prompt 增强 → 流式输出
+#
+# 流程概览：
+#   Step 1: 用户 prompt → Embedding API（BAAI/bge-m3）→ query_vector(1024D)
+#   Step 2: query_vector → pgvector cosine 检索 → Top-2 文本切片
+#   Step 3: 切片拼接成参考资料 → 注入 system prompt
+#   Step 4: 增强后的 messages → DeepSeek API（stream=True）→ SSE 逐块推前端
+#
+# ★ 关键指标（终端质检打印）：
+#   - 每个检索结果的 ID / 相似度 / 前 100 字预览
+#   - 让你核查大模型有没有"看着小抄回答"
+
+@app.post("/v1/chat/rag")
+async def chat_rag(req: StreamChatRequest):
+    """
+    RAG 增强流式对话接口。
+
+    测试用例（需先执行 rag_pipeline.py --ingest 入库）：
+      curl -X POST http://127.0.0.1:8000/v1/chat/rag \\
+        -H "Content-Type: application/json" \\
+        -d '{"prompt":"我今天练背应该注意什么？","session_id":"rag-test"}' \\
+        -N
+
+      curl -X POST http://127.0.0.1:8000/v1/chat/rag \\
+        -H "Content-Type: application/json" \\
+        -d '{"prompt":"硬拉的标准动作是什么？","session_id":"rag-test"}' \\
+        -N
+    """
+    # ------ 8.1 会话管理 ------
+    session_id = req.session_id or str(uuid.uuid4())
+
+    if session_id not in conversations:
+        conversations[session_id] = []
+
+    history: List[dict] = conversations[session_id]
+
+    # ========================================================================
+    # ★ Step 1 & 2: 向量检索（RAG 的 "Retrieval" 环节）
+    # ========================================================================
+    # 把用户问题变成向量 → 去 pgvector 里找最相关的知识切片。
+    #
+    # ★ 对照 Java：
+    #   这里相当于一个同步的 Feign 调用链：
+    #     EmbeddingService.embed(prompt) → pgvectorClient.search(vector)
+    #   但 Python 的 async/await 让两个 I/O 操作串在一起不阻塞线程。
+    #   在 Java WebFlux 中同样的效果需要写：
+    #     return embeddingMono.flatMap(vector -> pgvectorMono.map(rows -> ...))
+    #   嵌套回调的阅读体验远不如 await。
+
+    try:
+        query_vector, retrieved = await rag_retrieve(req.prompt, top_k=2)
+    except HTTPException:
+        raise  # 配置错误直接抛出
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"RAG 检索失败: {e}")
+
+    # ========================================================================
+    # ★ 质检打印：后端控制台可视化检索结果
+    # ========================================================================
+    # 生产环境可以改用 logging.info()，这里为了学习用 print 直出。
+    width = 70
+    print(f"\n{'═' * width}")
+    print(f"  🔍 RAG 检索质检  |  Session: {session_id[:8]}...")
+    print(f"{'═' * width}")
+    print(f"  用户提问: \"{req.prompt}\"")
+    print(f"  Embedding: {EMBEDDING_MODEL}（{len(query_vector)}D）")
+    print(f"{'─' * width}")
+    if not retrieved:
+        print("  ⚠️ 未检索到相关切片（数据库为空或相似度太低）")
+    else:
+        for i, chunk in enumerate(retrieved, 1):
+            preview = chunk["content"][:100].replace("\n", " ")
+            print(f"  🏆 Top-{i}  id={chunk['id']}  相似度={chunk['similarity']:.4f}")
+            print(f"     {preview}...")
+    print(f"{'═' * width}\n")
+
+    # ========================================================================
+    # ★ Step 3: 组装增强 messages（RAG 的 "Augmented" 环节）
+    # ========================================================================
+    # build_rag_messages 把检索结果注入 system prompt，
+    # 生成类似下面的结构：
+    #   [
+    #     {role:"system", content:"严格基于参考资料回答...\n[参考资料1]...\n[参考资料2]..."},
+    #     ...历史消息（不含旧 system prompt）...,
+    #     {role:"user", content:"我今天练背应该注意什么？"},
+    #   ]
+    #
+    # ★ 对照 Java：
+    #   这里相当于 Spring AI 的 PromptTemplate 或 Guava 的 Joiner：
+    #     String context = retrieved.stream()
+    #         .map(c -> "[参考资料" + c.id + "] " + c.content)
+    #         .collect(Collectors.joining("\n---\n"));
+    #     Message systemMsg = new SystemMessage(ragTemplate.render(context, query));
+    augmented_messages = build_rag_messages(req.prompt, retrieved, history)
+
+    # ========================================================================
+    # ★ Step 4: 流式输出（RAG 的 "Generation" 环节）
+    # ========================================================================
+    # 此时 augmented_messages 已包含参考资料上下文，
+    # 大模型会基于这些资料生成最终回复。
+    #
+    # ★ 仍然传 tools=TOOLS！
+    #   RAG 检索 + Function Calling 可以共存：
+    #   如果用户问的是知识库里的内容 → RAG 提供上下文
+    #   如果用户问的是需要实时查询的数据（如蛋白质摄入）→ FC 调用工具
+    #   两者同时传给大模型，大模型自行决策用哪个。
+    #
+    # ★ 对照 Java（大规模并发优化）：
+    #   见本文件末尾的 "Java 思维对照：RAG 串行 I/O 的并发优化"
+
+    async def rag_generate():
+        """异步生成器 — RAG 增强后的流式推送给客户端"""
+        full_reply: str = ""
+        try:
+            stream = await client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=augmented_messages,  # ★ 注入参考资料后的完整 messages
+                stream=True,
+                max_tokens=2048,
+                tools=TOOLS,                 # ★ RAG + FC 共存
+            )
+
+            async for chunk in stream:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta is None:
+                    continue
+
+                content = delta.content
+                if content:
+                    full_reply += content
+                    sse_data = json.dumps(
+                        {"delta": content, "session_id": session_id},
+                        ensure_ascii=False,
+                    )
+                    yield f"data: {sse_data}\n\n"
+
+                finish = chunk.choices[0].finish_reason if chunk.choices else None
+                if finish:
+                    break
+
+            # 流结束：把原始 user 消息 + assistant 最终回复追加到历史
+            # 注意：这里追加的是不带 RAG 上下文的原始消息，
+            # 因为 RAG 注入的 system prompt 只在当前轮有效。
+            if full_reply:
+                history.append({"role": "user", "content": req.prompt})
+                history.append({"role": "assistant", "content": full_reply})
+
+            yield "data: [DONE]\n\n"
+
+        except Exception as e:
+            error_data = json.dumps({"error": str(e)}, ensure_ascii=False)
+            yield f"data: {error_data}\n\n"
+
+    return StreamingResponse(
+        rag_generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Session-Id": session_id,
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
-# 8) 辅助路由：查看 / 清除历史
+# 9) 辅助路由：查看 / 清除历史
 # ---------------------------------------------------------------------------
 @app.get("/v1/chat/history/{session_id}")
 async def get_history(session_id: str):
@@ -950,7 +1310,7 @@ async def health() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 9) 静态文件服务 + 前端聊天页面
+# 10) 静态文件服务 + 前端聊天页面
 # ---------------------------------------------------------------------------
 # FastAPI 的 StaticFiles 会挂载整个目录，访问 /static/chat.html 即可。
 # 下面的 / 路由重定向到聊天页面，方便直接打开 http://127.0.0.1:8000
@@ -967,3 +1327,147 @@ async def root():
     """默认跳转到聊天页面"""
     chat_html = os.path.join(_static_dir, "chat.html")
     return FileResponse(chat_html)
+
+
+# ============================================================================
+# ★ Java 思维对照：RAG 串行 I/O 在高并发下的吞吐量优化
+# ============================================================================
+#
+# 问题：每次聊天都要 "Embedding API → pgvector 查询 → LLM 流式生成"，
+#       这是一个典型的串行 I/O 链路。在 Java 中如何进行吞吐量优化？
+#
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  Python 当前架构（单请求路径）                                        │
+# │                                                                     │
+# │  用户请求                                                           │
+# │    → await embeddings.create()      // 网络 I/O，~50-200ms          │
+# │    → await asyncio.to_thread(pg)    // DB I/O，~1-5ms               │
+# │    → async for chunk in stream      // 流式 I/O，~1-10s             │
+# │                                                                     │
+# │  Python asyncio 的优势：                                            │
+# │    每个 await 点释放事件循环，单线程可同时处理数百请求。              │
+# │    不需要线程池、不需要 CompletableFuture、不需要回调。              │
+# │    这是"协作式多任务"——代码看起来是同步的，执行上是并发的。           │
+# └─────────────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  Java 工程优化方案（按复杂度递增）                                    │
+# │                                                                     │
+# │  方案 1 — CompletableFuture 异步编排（Spring Boot 标配）             │
+# │  ─────────────────────────────────────────────────────               │
+# │  把三个 I/O 调用包装成 CompletableFuture，用 thenCompose 串联：      │
+# │                                                                     │
+# │    CompletableFuture<float[]> embedFuture =                          │
+# │        CompletableFuture.supplyAsync(                                │
+# │            () -> embeddingService.embed(prompt),                     │
+# │            embedExecutor       // ★ 自定义线程池！                   │
+# │        );                                                           │
+# │                                                                     │
+# │    CompletableFuture<List<Chunk>> searchFuture =                     │
+# │        embedFuture.thenComposeAsync(                                 │
+# │            vector -> CompletableFuture.supplyAsync(                  │
+# │                () -> pgvectorService.search(vector),                 │
+# │                dbExecutor      // ★ 另一个线程池！                   │
+# │            )                                                        │
+# │        );                                                           │
+# │                                                                     │
+# │    CompletableFuture<StreamingResponse> llmFuture =                  │
+# │        searchFuture.thenComposeAsync(                                │
+# │            chunks -> {                                               │
+# │                String context = buildContext(chunks);                │
+# │                return llmService.streamChat(context, prompt);        │
+# │            },                                                        │
+# │            llmExecutor         // ★ 第三个线程池                     │
+# │        );                                                           │
+# │                                                                     │
+# │  关键点：每种 I/O 用独立线程池，避免慢的调用耗尽共享池。              │
+# │  但这只是单请求的异步化，高并发下还需要：                             │
+# │                                                                     │
+# │  方案 2 — Reactor / WebFlux 全链路非阻塞                             │
+# │  ────────────────────────────────────────                             │
+# │  用 Spring WebFlux + R2DBC + WebClient 替代阻塞组件：                │
+# │                                                                     │
+# │    return webClient.post(embedApi, prompt)                           │
+# │        .bodyToMono(float[].class)                   // 非阻塞 HTTP  │
+# │        .flatMap(vector -> r2dbcClient.sql(                          │
+# │            "SELECT ... <=> $1 LIMIT 2"                               │
+# │        ).bind(0, vector).fetch().all())             // 非阻塞 DB    │
+# │        .flatMap(chunks -> {                                         │
+# │            String ctx = buildContext(chunks);                        │
+# │            return ServerSentEvent.fromPublisher(                     │
+# │                llmClient.stream(ctx, prompt)        // 非阻塞 LLM   │
+# │            );                                                       │
+# │        });                                                          │
+# │                                                                     │
+# │  优势：整个链路零阻塞，一个 Netty 线程池（核数 × 2）即可承载         │
+# │        数千并发。和 Python asyncio 的哲学最接近。                     │
+# │  代价：调试地狱 —— stack trace 里全是 Mono.flatMap 嵌套。           │
+# │                                                                     │
+# │  方案 3 — 消息队列削峰 + 异步解耦                                    │
+# │  ─────────────────────────────────────                                │
+# │  适用于突发流量（如双11活动页面的 AI 问答）：                         │
+# │                                                                     │
+# │    用户请求 → Kafka topic: rag-requests                             │
+# │              ↓                                                     │
+# │    Consumer Group (可动态扩缩容):                                    │
+# │      1) Embedding Worker  × N 台                                    │
+# │      2) pgvector 本身已支持并发查询（PostgreSQL 连接池）              │
+# │      3) LLM Worker        × M 台（按 API RPM 上限设定）              │
+# │              ↓                                                     │
+# │    结果写回 Kafka/Redis → 前端通过 SSE/WebSocket 订阅结果            │
+# │                                                                     │
+# │  优势：每个环节独立扩缩容、流量削峰、失败重试天然支持                 │
+# │  代价：延迟增加（Kafka 往返 50-200ms），架构复杂度翻倍               │
+# │                                                                     │
+# │  方案 4 — 本地缓存（Caffeine / Guava Cache）                         │
+# │  ─────────────────────────────────────────────                       │
+# │  高频问题（如 "硬拉标准动作"）的 Embedding + 检索结果缓存：          │
+# │                                                                     │
+# │    Cache<String, List<Chunk>> ragCache = Caffeine.newBuilder()       │
+# │        .maximumSize(10_000)                                         │
+# │        .expireAfterWrite(30, TimeUnit.MINUTES)                      │
+# │        .build();                                                    │
+# │                                                                     │
+# │    List<Chunk> chunks = ragCache.get(prompt, key -> {               │
+# │        float[] vec = embed(key);                                    │
+# │        return pgvector.search(vec, 2);                              │
+# │    });                                                              │
+# │                                                                     │
+# │  效果：90%+ 的常见问题命中缓存，Embedding API 调用量降为 1/10。      │
+# │  在 Python 中可用 functools.lru_cache 或 Redis 实现同样效果。         │
+# │                                                                     │
+# │  方案 5 — 虚拟线程（Java 21+ Virtual Threads）                       │
+# │  ───────────────────────────────────────────────                      │
+# │  如果你不想学 WebFlux 的 Mono/flatMap，Java 21 的虚拟线程             │
+# │  让"一请求一线程"达到近似 asyncio 的并发能力：                        │
+# │                                                                     │
+# │    // Spring Boot 3.2 + 虚拟线程                                    │
+# │    @GetMapping("/chat/rag")                                         │
+# │    public StreamingResponse chatRag(String prompt) {                │
+# │        float[] vec = embedService.embed(prompt);    // 阻塞但轻量   │
+# │        List<Chunk> chunks = pgvectorRepo.search(vec);               │
+# │        return llmService.stream(buildContext(chunks, prompt));       │
+# │    }                                                                │
+# │    // 每个请求占用一个虚拟线程（~1KB 栈内存），                         │
+# │    // Tomcat 可以同时跑几十万个虚拟线程。                              │
+# │    // 代码和同步写法一模一样，不需要 CompletableFuture。              │
+# │                                                                     │
+# │  这其实是 Python asyncio 的 "哲学翻版"——                           │
+# │     Python: 一个线程 + await 挂起点 = 高并发                         │
+# │     Java:   百万虚拟线程 + 阻塞式写法 = 高并发                       │
+# │     Python 的 await 是编译器帮你插入的挂起点                          │
+# │     Java 虚拟线程的挂起是 JVM 在阻塞 I/O 时自动做的                   │
+# │     殊途同归。                                                      │
+# │                                                                     │
+# └─────────────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  ▎实战建议（针对你当前的 try-ai 阶段）                               │
+# │                                                                     │
+# │  1) 当前的串行 await 架构先跑通，别过早优化。                        │
+# │  2) 下一步加 lru_cache 或 Redis 缓存高频问答（最省钱、最有效）。      │
+# │  3) 如果日活破千，把 Embedding + pgvector 拆成独立 Python 微服务，   │
+# │     Java 主服务通过 HTTP/gRPC 调用（保持语言边界清晰）。              │
+# │  4) 如果日活破万 → Kafka 异步解耦 + 各环节独立扩缩容。               │
+# └─────────────────────────────────────────────────────────────────────┘
+""" 文件尾注释结束 """

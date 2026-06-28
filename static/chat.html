@@ -230,7 +230,8 @@
   <h1>⚡ try-ai 聊天</h1>
   <div class="header-badges">
     <span id="sessionDisplay" title="点击复制 Session ID">🆔 ...</span>
-    <span class="badge active" data-mode="fc" onclick="switchMode('fc')">🔧 Function Calling</span>
+    <span class="badge active" data-mode="rag" onclick="switchMode('rag')">🧠 RAG 检索</span>
+    <span class="badge" data-mode="fc" onclick="switchMode('fc')">🔧 FC</span>
     <span class="badge" data-mode="stream" onclick="switchMode('stream')">📡 流式</span>
     <span class="badge" data-mode="normal" onclick="switchMode('normal')">📦 普通</span>
     <span class="badge" onclick="clearSession()" title="新建会话">🔄 新会话</span>
@@ -263,13 +264,14 @@
 // ============================================================
 // 状态管理
 // ============================================================
-let mode = 'fc';                         // fc | stream | normal
+let mode = 'rag';                         // rag | fc | stream | normal
 let sessionId = localStorage.getItem('tryai_session') || '';
 const API = 'http://127.0.0.1:8000';
 let isStreaming = false;
 
 // mode → {endpoint, streaming}
 const MODE_CONFIG = {
+  rag:    { endpoint: '/v1/chat/rag',    streaming: true  },
   fc:     { endpoint: '/v1/chat/fc',     streaming: true  },
   stream: { endpoint: '/v1/chat/stream', streaming: true  },
   normal: { endpoint: '/v1/chat',        streaming: false },
@@ -293,6 +295,7 @@ function switchMode(m) {
 
 function updatePlaceholder() {
   const hints = {
+    rag: 'RAG 模式 — 先查知识库再回答，不瞎编…',
     fc: 'Function Calling 模式 — 试试问健身数据…',
     stream: '流式模式 — 常规对话，打字机效果',
     normal: '普通模式 — 一次性返回，无历史记录',
